@@ -8,6 +8,7 @@ import io
 import asyncio
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client
 
 # Path to the agent-browser binary
 AGENT_BROWSER_PATH = os.environ.get("AGENT_BROWSER_PATH", "agent-browser")
@@ -65,40 +66,52 @@ def perform_action(action, selector, text, session_id):
     snap = get_snapshot(session_id)
     return img, f"Performed {action} on {selector}", snap
 
-async def list_mcp_tools():
-    # Attempt to start the Rust MCP server and list its tools
-    # Assuming it's built and available at a known path or via AGENT_BROWSER_MCP_PATH
-    mcp_bin = os.environ.get("AGENT_BROWSER_MCP_PATH", "./mcp-server-agent-browser/target/release/mcp-server-agent-browser")
-    if not os.path.exists(mcp_bin):
-        # Fallback to dev path
-        mcp_bin = "./mcp-server-agent-browser/target/debug/mcp-server-agent-browser"
+async def list_mcp_tools(connection_type, http_url):
+    if connection_type == "HTTP/SSE":
+        if not http_url:
+            return "Please provide an HTTP/SSE URL."
+        try:
+            async with sse_client(http_url) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = await session.list_tools()
+                    return format_tools(tools)
+        except Exception as e:
+            return f"Error connecting to HTTP MCP server: {str(e)}"
+    else:
+        # Attempt to start the Rust MCP server and list its tools
+        mcp_bin = os.environ.get("AGENT_BROWSER_MCP_PATH", "./mcp-server-agent-browser/target/release/mcp-server-agent-browser")
+        if not os.path.exists(mcp_bin):
+            mcp_bin = "./mcp-server-agent-browser/target/debug/mcp-server-agent-browser"
 
-    if not os.path.exists(mcp_bin):
-        return "MCP server binary not found. Please build it first."
+        if not os.path.exists(mcp_bin):
+            return f"MCP server binary not found at {mcp_bin}. Please build it first."
 
-    server_params = StdioServerParameters(
-        command=mcp_bin,
-        args=[],
-        env=None
-    )
+        server_params = StdioServerParameters(
+            command=mcp_bin,
+            args=[],
+            env=None
+        )
 
-    try:
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                tools = await session.list_tools()
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    tools = await session.list_tools()
+                    return format_tools(tools)
+        except Exception as e:
+            return f"Error connecting to local MCP server: {str(e)}"
 
-                output = "# Available MCP Endpoints\n\n"
-                for tool in tools.tools:
-                    output += f"### {tool.name}\n"
-                    output += f"{tool.description}\n\n"
-                    output += f"**Parameters:**\n```json\n{json.dumps(tool.inputSchema, indent=2)}\n```\n\n"
-                return output
-    except Exception as e:
-        return f"Error connecting to MCP server: {str(e)}"
+def format_tools(tools):
+    output = "# Available MCP Endpoints\n\n"
+    for tool in tools.tools:
+        output += f"### {tool.name}\n"
+        output += f"{tool.description}\n\n"
+        output += f"**Parameters:**\n```json\n{json.dumps(tool.inputSchema, indent=2)}\n```\n\n"
+    return output
 
-def get_tools_sync():
-    return asyncio.run(list_mcp_tools())
+def get_tools_sync(connection_type, http_url):
+    return asyncio.run(list_mcp_tools(connection_type, http_url))
 
 with gr.Blocks(title="Agent Browser Interface") as demo:
     gr.Markdown("# 🌐 Agent Browser UI")
@@ -129,8 +142,29 @@ with gr.Blocks(title="Agent Browser Interface") as demo:
                 snapshot_output = gr.Code(label="Accessibility Tree (Snapshot)", language="markdown")
 
     with gr.Tab("MCP Endpoints Overview"):
+        with gr.Row():
+            connection_type = gr.Radio(
+                choices=["Local Binary (Stdio)", "HTTP/SSE"],
+                value="Local Binary (Stdio)",
+                label="Connection Type"
+            )
+            http_url_input = gr.Textbox(
+                label="HTTP/SSE URL",
+                placeholder="http://localhost:3000/sse",
+                visible=False
+            )
+
         refresh_btn = gr.Button("Fetch/Refresh MCP Tools")
         mcp_overview = gr.Markdown("Click the button to load available tools from the MCP server.")
+
+        def update_url_visibility(choice):
+            return gr.update(visible=(choice == "HTTP/SSE"))
+
+        connection_type.change(
+            fn=update_url_visibility,
+            inputs=[connection_type],
+            outputs=[http_url_input]
+        )
 
     # Event handlers
     nav_btn.click(
@@ -147,7 +181,7 @@ with gr.Blocks(title="Agent Browser Interface") as demo:
 
     refresh_btn.click(
         fn=get_tools_sync,
-        inputs=[],
+        inputs=[connection_type, http_url_input],
         outputs=[mcp_overview]
     )
 
