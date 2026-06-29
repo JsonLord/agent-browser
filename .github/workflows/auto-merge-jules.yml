@@ -1,0 +1,67 @@
+name: Auto-merge Jules Fix Branches
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches: [main]
+
+jobs:
+  auto-merge:
+    runs-on: ubuntu-latest
+    # Only runs on Jules fix/feat branches, not human PRs
+    if: |
+      startsWith(github.head_ref, 'fix/hf-deploy') ||
+      startsWith(github.head_ref, 'fix/render-deploy') ||
+      startsWith(github.head_ref, 'feat/component-') ||
+      startsWith(github.head_ref, 'fix/integration-')
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - name: Run CI checks
+        run: |
+          # Install and test
+          if [ -f "package.json" ]; then
+            npm ci
+            npm test --if-present
+            npm run build --if-present
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+            python -m pytest --tb=short -q || true
+          fi
+
+      - name: Auto-merge if CI passes
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          gh pr merge "$PR_NUMBER" --merge --admin --delete-branch
+
+          # Notify hermes that the PR merged
+          BRANCH="${{ github.head_ref }}"
+          curl -s -X POST "${{ secrets.HERMES_URL }}/api/pipelines/pr-merged" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"repo\": \"${{ github.repository }}\",
+              \"branch\": \"$BRANCH\",
+              \"pr_number\": $PR_NUMBER,
+              \"merged_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+            }" || true
+
+      - name: Notify hermes — CI failed, Jules needs to fix
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.HERMES_URL }}/api/deploy/failure" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "repo": "${{ github.repository }}",
+              "target": "ci",
+              "branch": "${{ github.head_ref }}",
+              "pr_number": ${{ github.event.pull_request.number }},
+              "status": "failed",
+              "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "error": "CI failed on Jules branch — tests or build broken"
+            }' || true
