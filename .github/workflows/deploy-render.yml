@@ -1,0 +1,73 @@
+name: Deploy to Render
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'vite.config.*'
+      - '.github/workflows/deploy-render.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trigger Render deploy
+        id: deploy
+        run: |
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.render.com/v1/services/${{ secrets.RENDER_SERVICE_ID }}/deploys" \
+            -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"clearCache":false}')
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -1)
+          echo "deploy_id=$(echo $BODY | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get(\"id\",\"\"))')" >> $GITHUB_OUTPUT
+          if [ "$HTTP_CODE" != "201" ]; then
+            echo "Render API returned $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Wait for Render deploy to finish
+        run: |
+          DEPLOY_ID="${{ steps.deploy.outputs.deploy_id }}"
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s \
+              "https://api.render.com/v1/deploys/$DEPLOY_ID" \
+              -H "Authorization: Bearer ${{ secrets.RENDER_API_KEY }}" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("status",""))')
+            echo "Deploy status: $STATUS"
+            if [ "$STATUS" = "live" ]; then exit 0; fi
+            if [ "$STATUS" = "failed" ] || [ "$STATUS" = "canceled" ]; then exit 1; fi
+            sleep 20
+          done
+          echo "Timeout waiting for Render deploy"
+          exit 1
+
+      - name: Notify hermes — render deploy success
+        if: success()
+        run: |
+          SLUG=$(echo "${{ github.repository }}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+          curl -s -X POST "${{ secrets.HERMES_URL }}/api/deploy/projects/${SLUG}/deployed" \
+            -H "Content-Type: application/json" \
+            -d '{"target":"render","run_id":"${{ github.run_id }}","url":"${{ secrets.RENDER_URL }}"}' \
+            || true
+
+      - name: Notify hermes — render deploy failure
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.HERMES_URL }}/api/deploy/failure" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "repo": "${{ github.repository }}",
+              "target": "render",
+              "status": "failed",
+              "run_id": "${{ github.run_id }}",
+              "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "error": "Render deploy failed — see run logs"
+            }' || true
