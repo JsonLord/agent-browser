@@ -1,0 +1,71 @@
+name: Deploy to HuggingFace Space
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'app.py'
+      - 'requirements.txt'
+      - 'Dockerfile'
+      - '.github/workflows/deploy-hf.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: Notify hermes — deployment started
+        run: |
+          curl -s -X POST "${{ secrets.HERMES_URL }}/api/deploy/failure" \
+            -H "Content-Type: application/json" \
+            -d '{"repo":"${{ github.repository }}","target":"huggingface","status":"started","run_id":"${{ github.run_id }}"}' \
+            || true
+
+      - name: Push to HuggingFace Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config user.email "ci@github.com"
+          git config user.name "GitHub Actions"
+          git remote add hf https://${{ secrets.HF_PROFILE }}:${HF_TOKEN}@huggingface.co/spaces/${{ secrets.HF_PROFILE }}/${{ secrets.HF_SPACE }}
+
+          # Push backend subdirectory if it exists, otherwise push root
+          if [ -d "backend" ]; then
+            git subtree push --prefix=backend hf main
+          else
+            git push hf main --force
+          fi
+
+      - name: Notify hermes — deployment success
+        if: success()
+        run: |
+          curl -s -X PATCH "${{ secrets.HERMES_URL }}/api/deploy/failures/latest/resolve" \
+            -H "Content-Type: application/json" \
+            -d '{"repo":"${{ github.repository }}","target":"huggingface","run_id":"${{ github.run_id }}"}' \
+            || true
+
+          # Advance the pipeline deployment phase
+          SLUG=$(echo "${{ github.repository }}" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+          curl -s -X POST "${{ secrets.HERMES_URL }}/api/deploy/projects/${SLUG}/deployed" \
+            -H "Content-Type: application/json" \
+            -d '{"run_id":"${{ github.run_id }}","url":"https://${{ secrets.HF_PROFILE }}-${{ secrets.HF_SPACE }}.hf.space"}' \
+            || true
+
+      - name: Notify hermes — deployment failure
+        if: failure()
+        run: |
+          curl -s -X POST "${{ secrets.HERMES_URL }}/api/deploy/failure" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "repo": "${{ github.repository }}",
+              "target": "huggingface",
+              "status": "failed",
+              "run_id": "${{ github.run_id }}",
+              "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+              "error": "HuggingFace deploy push failed — see run logs"
+            }' || true
